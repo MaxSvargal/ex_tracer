@@ -1,8 +1,7 @@
 defmodule ExTracer.RuntimeNormalizer do
   @moduledoc false
 
-  alias ExTracer.{FlowExpander, FlowSummary, RuntimeTrace, Utils}
-
+  alias ExTracer.{ActionSemantics, FlowExpander, FlowSummary, RuntimeTrace, Utils}
   def normalize(nil, _test_case, _lookup, _adapters), do: []
 
   def normalize(%RuntimeTrace{} = runtime_trace, test_case, lookup, adapters) do
@@ -10,19 +9,38 @@ defmodule ExTracer.RuntimeNormalizer do
       runtime_trace.events
       |> Enum.sort_by(&Map.get(&1, "sequence", 0))
       |> Enum.map(fn event ->
+        node_id = ActionSemantics.canonical_graph_node_id(Map.get(event, "node_id"))
+        action = infer_runtime_action(event, node_id, lookup)
+
+        focus_node_id =
+          ActionSemantics.infer_focus_node_id(
+            Map.get(event, "focus_node_id"),
+            node_id,
+            action,
+            lookup
+          )
+
         FlowSummary.build_step(%{
-          type: normalize_runtime_atom(Map.get(event, "type"), :reaction),
-          kind: normalize_runtime_atom(Map.get(event, "action_kind") || Map.get(event, "kind"), :observation),
+          type: ActionSemantics.normalize_atom(Map.get(event, "type"), :reaction),
+          kind:
+            ActionSemantics.normalize_atom(
+              Map.get(event, "action_kind") || Map.get(event, "kind"),
+              :observation
+            ),
           label: Map.get(event, "label") || runtime_label(event),
-          node_id: Map.get(event, "node_id"),
-          focus_node_id: Map.get(event, "focus_node_id") || Map.get(event, "node_id"),
-          focus_targets: Utils.normalize_string_list(Map.get(event, "focus_targets")),
+          node_id: node_id,
+          focus_node_id: focus_node_id,
+          focus_targets:
+            event
+            |> Map.get("focus_targets")
+            |> Utils.normalize_string_list()
+            |> Enum.map(&ActionSemantics.canonical_graph_node_id/1),
           emits: Utils.normalize_string_list(Map.get(event, "emits")),
           reacts_to: Map.get(event, "reacts_to"),
-          action: Map.get(event, "action"),
+          action: action,
           actor: Map.get(event, "actor"),
           provenance: :executed,
-          status: normalize_runtime_atom(Map.get(event, "status"), :passed),
+          status: ActionSemantics.normalize_atom(Map.get(event, "status"), :passed),
           module_function: Map.get(event, "module_function"),
           source_snippet: Map.get(event, "source_snippet"),
           result: Utils.normalize_optional_string(Map.get(event, "result")),
@@ -39,38 +57,6 @@ defmodule ExTracer.RuntimeNormalizer do
     |> FlowSummary.collapse_duplicate_runtime_steps()
   end
 
-  def normalize_runtime_atom(nil, default), do: default
-  def normalize_runtime_atom(value, _default) when is_atom(value), do: value
-
-  def normalize_runtime_atom(value, default) when is_binary(value) do
-    case value do
-      "entry" -> :entry
-      "reaction" -> :reaction
-      "assertion" -> :assertion
-      "observation" -> :observation
-      "command" -> :command
-      "event" -> :event
-      "job" -> :job
-      "action_prepare" -> :action_prepare
-      "action_execute" -> :action_execute
-      "trigger_receive" -> :trigger_receive
-      "job_enqueue" -> :job_enqueue
-      "job_execute" -> :job_execute
-      "read" -> :read
-      "create" -> :create
-      "update" -> :update
-      "destroy" -> :destroy
-      "write" -> :write
-      "rule_check" -> :rule_check
-      "assert_result" -> :assert_result
-      "passed" -> :passed
-      "failed" -> :failed
-      "short_circuit" -> :short_circuit
-      "matched" -> :matched
-      _ -> default
-    end
-  end
-
   defp runtime_label(event) do
     case Map.get(event, "action") do
       nil ->
@@ -79,5 +65,14 @@ defmodule ExTracer.RuntimeNormalizer do
       action ->
         "Execute #{List.last(String.split(Map.get(event, "node_id") || "node", "."))}.#{action}"
     end
+  end
+
+  defp infer_runtime_action(event, node_id, lookup) do
+    ActionSemantics.infer_action(
+      node_id,
+      Map.get(event, "action"),
+      Map.get(event, "action_kind") || Map.get(event, "kind"),
+      lookup
+    )
   end
 end
